@@ -405,6 +405,12 @@ const (
 	TblTracesToKeys   = "TracesToKeys"
 	TblTracesToIdx    = "TracesToIdx"
 
+	// Prune progress of execution: tableName -> [8bytes of invStep]latest pruned key
+	// Could use table constants `Tbl{Account,Storage,Code,Commitment}Keys` for domains
+	// corresponding history tables `Tbl{Account,Storage,Code,Commitment}HistoryKeys` for history
+	// and `Tbl{Account,Storage,Code,Commitment}Idx` for inverted indices
+	TblPruningProgress = "PruningProgress"
+
 	Snapshots = "Snapshots" // name -> hash
 
 	//State Reconstitution
@@ -461,7 +467,8 @@ const (
 	LightClientUpdates = "LightClientUpdates"
 	// Beacon historical data
 	// ValidatorIndex => [Field]
-	ValidatorPublicKeys = "ValidatorPublickeys"
+	ValidatorPublicKeys         = "ValidatorPublickeys"
+	InvertedValidatorPublicKeys = "InvertedValidatorPublickeys"
 	// ValidatorIndex + Slot => [Field]
 	ValidatorEffectiveBalance = "ValidatorEffectiveBalance"
 	ValidatorSlashings        = "ValidatorSlashings"
@@ -623,6 +630,8 @@ var ChaindataTables = []string{
 	TblTracesToKeys,
 	TblTracesToIdx,
 
+	TblPruningProgress,
+
 	Snapshots,
 	MaxTxNum,
 
@@ -653,6 +662,7 @@ var ChaindataTables = []string{
 	LastBeaconSnapshot,
 	// State Reconstitution
 	ValidatorPublicKeys,
+	InvertedValidatorPublicKeys,
 	ValidatorEffectiveBalance,
 	ValidatorBalance,
 	ValidatorSlashings,
@@ -784,6 +794,7 @@ var ChaindataTablesCfg = TableCfg{
 	TblTracesFromIdx:         {Flags: DupSort},
 	TblTracesToKeys:          {Flags: DupSort},
 	TblTracesToIdx:           {Flags: DupSort},
+	TblPruningProgress:       {Flags: DupSort},
 	RAccountKeys:             {Flags: DupSort},
 	RAccountIdx:              {Flags: DupSort},
 	RStorageKeys:             {Flags: DupSort},

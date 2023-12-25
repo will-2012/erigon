@@ -57,7 +57,7 @@ func (r *beaconResponse) withFinalized(finalized bool) (out *beaconResponse) {
 	out.Finalized = new(bool)
 	out.ExecutionOptimistic = new(bool)
 	out.Finalized = &finalized
-	return r
+	return out
 }
 
 func (r *beaconResponse) withVersion(version clparams.StateVersion) (out *beaconResponse) {
@@ -65,7 +65,7 @@ func (r *beaconResponse) withVersion(version clparams.StateVersion) (out *beacon
 	*out = *r
 	out.Version = new(clparams.StateVersion)
 	out.Version = &version
-	return r
+	return out
 }
 
 //// In case of it being a json we need to also expose finalization, version, etc...
@@ -259,4 +259,13 @@ func uint64FromQueryParams(r *http.Request, name string) (*uint64, error) {
 		return nil, err
 	}
 	return &num, nil
+}
+
+// decode a list of strings from the query params
+func stringListFromQueryParams(r *http.Request, name string) ([]string, error) {
+	str := r.URL.Query().Get(name)
+	if str == "" {
+		return nil, nil
+	}
+	return regexp.MustCompile(`\s*,\s*`).Split(str, -1), nil
 }

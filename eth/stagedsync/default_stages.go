@@ -3,11 +3,11 @@ package stagedsync
 import (
 	"context"
 
-	"github.com/ledgerwatch/log/v3"
-
+	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/eth/ethconfig"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
+	"github.com/ledgerwatch/log/v3"
 )
 
 func DefaultStages(ctx context.Context,
@@ -117,6 +117,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.Execution,
 			Description: "Execute blocks w/o hash checks",
+			Disabled:    dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnExecuteBlocksStage(s, u, tx, 0, ctx, exec, firstCycle, logger)
 			},
@@ -130,7 +131,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.HashState,
 			Description: "Hash the key in the state",
-			Disabled:    bodies.historyV3,
+			Disabled:    bodies.historyV3 || ethconfig.EnableHistoryV4InTest || dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnHashStateStage(s, tx, hashState, ctx, logger)
 			},
@@ -144,7 +145,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.IntermediateHashes,
 			Description: "Generate intermediate hashes and computing state root",
-			Disabled:    bodies.historyV3,
+			Disabled:    bodies.historyV3 || ethconfig.EnableHistoryV4InTest || dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				if exec.chainConfig.IsPrague(0) {
 					_, err := SpawnVerkleTrie(s, u, tx, trieCfg, ctx, logger)
@@ -167,7 +168,7 @@ func DefaultStages(ctx context.Context,
 			ID:                  stages.CallTraces,
 			Description:         "Generate call traces index",
 			DisabledDescription: "Work In Progress",
-			Disabled:            bodies.historyV3,
+			Disabled:            bodies.historyV3 || dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnCallTraces(s, tx, callTraces, ctx, logger)
 			},
@@ -181,7 +182,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.AccountHistoryIndex,
 			Description: "Generate account history index",
-			Disabled:    bodies.historyV3,
+			Disabled:    bodies.historyV3 || dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnAccountHistoryIndex(s, tx, history, ctx, logger)
 			},
@@ -195,7 +196,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.StorageHistoryIndex,
 			Description: "Generate storage history index",
-			Disabled:    bodies.historyV3,
+			Disabled:    bodies.historyV3 || dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnStorageHistoryIndex(s, tx, history, ctx, logger)
 			},
@@ -209,7 +210,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.LogIndex,
 			Description: "Generate receipt logs index",
-			Disabled:    bodies.historyV3,
+			Disabled:    bodies.historyV3 || dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnLogIndex(s, tx, logIndex, ctx, 0, logger)
 			},
@@ -223,6 +224,7 @@ func DefaultStages(ctx context.Context,
 		{
 			ID:          stages.TxLookup,
 			Description: "Generate tx lookup index",
+			Disabled:    dbg.StagesOnlyBlocks,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnTxLookup(s, tx, 0 /* toBlock */, txLookup, ctx, logger)
 			},
@@ -484,7 +486,7 @@ func StateStages(ctx context.Context, headers HeadersCfg, bodies BodiesCfg, bloc
 		{
 			ID:          stages.HashState,
 			Description: "Hash the key in the state",
-			Disabled:    bodies.historyV3 && ethconfig.EnableHistoryV4InTest,
+			Disabled:    bodies.historyV3,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				return SpawnHashStateStage(s, tx, hashState, ctx, logger)
 			},
@@ -495,7 +497,7 @@ func StateStages(ctx context.Context, headers HeadersCfg, bodies BodiesCfg, bloc
 		{
 			ID:          stages.IntermediateHashes,
 			Description: "Generate intermediate hashes and computing state root",
-			Disabled:    bodies.historyV3 && ethconfig.EnableHistoryV4InTest,
+			Disabled:    bodies.historyV3,
 			Forward: func(firstCycle bool, badBlockUnwind bool, s *StageState, u Unwinder, tx kv.RwTx, logger log.Logger) error {
 				_, err := SpawnIntermediateHashesStage(s, u, tx, trieCfg, ctx, logger)
 				return err

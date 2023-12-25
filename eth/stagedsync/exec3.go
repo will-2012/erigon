@@ -195,26 +195,32 @@ func ExecV3(ctx context.Context,
 	}
 	if initialCycle {
 		if casted, ok := applyTx.(*temporal.Tx); ok {
-			casted.AggCtx().LogStats(casted, func(endTxNumMinimax uint64) uint64 {
+			casted.AggCtx().(*state2.AggregatorV3Context).LogStats(casted, func(endTxNumMinimax uint64) uint64 {
 				_, histBlockNumProgress, _ := rawdbv3.TxNums.FindBlockNum(casted, endTxNumMinimax)
 				return histBlockNumProgress
 			})
 		}
 	}
 
-	stageProgress := execStage.BlockNumber
-	var blockNum uint64
-	var maxTxNum uint64
-	outputTxNum := atomic.Uint64{}
-	blockComplete := atomic.Bool{}
+	inMemExec := state2.IsSharedDomains(applyTx)
+	var doms *state2.SharedDomains
+	if inMemExec {
+		doms = applyTx.(*state2.SharedDomains)
+	} else {
+		doms = state2.NewSharedDomains(applyTx)
+		defer doms.Close()
+	}
+
+	var (
+		inputTxNum    = doms.TxNum()
+		stageProgress = execStage.BlockNumber
+		outputTxNum   = atomic.Uint64{}
+		blockComplete = atomic.Bool{}
+
+		offsetFromBlockBeginning uint64
+		blockNum, maxTxNum       uint64
+	)
 	blockComplete.Store(true)
-
-	// MA setio
-	doms := state2.NewSharedDomains(applyTx)
-	defer doms.Close()
-
-	var inputTxNum = doms.TxNum()
-	var offsetFromBlockBeginning uint64
 
 	nothingToExec := func(applyTx kv.Tx) (bool, error) {
 		_, lastTxNum, err := rawdbv3.TxNums.Last(applyTx)
@@ -265,7 +271,7 @@ func ExecV3(ctx context.Context,
 		//_max, _ := rawdbv3.TxNums.Max(applyTx, blockNum)
 		//fmt.Printf("[commitment] found domain.txn %d, inputTxn %d, offset %d. DB found block %d {%d, %d}\n", doms.TxNum(), inputTxNum, offsetFromBlockBeginning, blockNum, _min, _max)
 		doms.SetBlockNum(_blockNum)
-		doms.SetTxNum(ctx, inputTxNum)
+		doms.SetTxNum(inputTxNum)
 		return nil
 	}
 	if applyTx != nil {
@@ -306,9 +312,10 @@ func ExecV3(ctx context.Context,
 	}
 	var err error
 
-	log.Warn("execv3 starting",
-		"inputTxNum", inputTxNum, "restored_block", blockNum,
-		"restored_txNum", doms.TxNum(), "offsetFromBlockBeginning", offsetFromBlockBeginning)
+	if maxBlockNum-blockNum > 16 {
+		log.Info(fmt.Sprintf("[%s] starting", execStage.LogPrefix()),
+			"from", blockNum, "to", maxBlockNum, "fromTxNum", doms.TxNum(), "offsetFromBlockBeginning", offsetFromBlockBeginning)
+	}
 
 	if initialCycle && blocksFreezeCfg.Produce {
 		log.Info(fmt.Sprintf("[snapshots] db has steps amount: %s", agg.StepsRangeInDBAsStr(applyTx)))
@@ -437,7 +444,7 @@ func ExecV3(ctx context.Context,
 						if doms.BlockNum() != outputBlockNum.GetValueUint64() {
 							panic(fmt.Errorf("%d != %d", doms.BlockNum(), outputBlockNum.GetValueUint64()))
 						}
-						_, err := doms.ComputeCommitment(ctx, true, false, outputBlockNum.GetValueUint64(), execStage.LogPrefix())
+						_, err := doms.ComputeCommitment(ctx, true, outputBlockNum.GetValueUint64(), execStage.LogPrefix())
 						if err != nil {
 							return err
 						}
@@ -446,9 +453,14 @@ func ExecV3(ctx context.Context,
 							return err
 						}
 						ac.Close()
-						if err = doms.Flush(ctx, tx); err != nil {
-							return err
+						if !inMemExec {
+							if err = doms.Flush(ctx, tx); err != nil {
+								return err
+							}
 						}
+						break
+					}
+					if inMemExec {
 						break
 					}
 
@@ -833,7 +845,7 @@ Loop:
 			case <-logEvery.C:
 				stepsInDB := rawdbhelpers.IdxStepsCountV3(applyTx)
 				progress.Log(rs, in, rws, count, inputBlockNum.Load(), outputBlockNum.GetValueUint64(), outputTxNum.Load(), execRepeats.GetValueUint64(), stepsInDB)
-				if rs.SizeEstimate() < commitThreshold {
+				if rs.SizeEstimate() < commitThreshold || inMemExec {
 					break
 				}
 				var (
@@ -851,7 +863,7 @@ Loop:
 				}
 
 				tt = time.Now()
-				if ok, err := flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), applyTx, doms, cfg, execStage, stageProgress, parallel, logger, u); err != nil {
+				if ok, err := flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), applyTx, doms, cfg, execStage, stageProgress, parallel, logger, u, inMemExec); err != nil {
 					return err
 				} else if !ok {
 					break Loop
@@ -884,7 +896,7 @@ Loop:
 									return err
 								}
 							}
-							if err := tx.(state2.HasAggCtx).AggCtx().PruneWithTimeout(ctx, 60*time.Minute, tx); err != nil {
+							if err := tx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).PruneWithTimeout(ctx, 60*time.Minute, tx); err != nil {
 								return err
 							}
 							return nil
@@ -937,7 +949,7 @@ Loop:
 
 	if !u.HasUnwindPoint() {
 		if b != nil {
-			_, err := flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), applyTx, doms, cfg, execStage, stageProgress, parallel, logger, u)
+			_, err := flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), applyTx, doms, cfg, execStage, stageProgress, parallel, logger, u, inMemExec)
 			if err != nil {
 				return err
 			}
@@ -998,7 +1010,7 @@ func dumpPlainStateDebug(tx kv.RwTx, doms *state2.SharedDomains) {
 		doms.Flush(context.Background(), tx)
 	}
 	{
-		it, err := tx.(state2.HasAggCtx).AggCtx().DomainRangeLatest(tx, kv.AccountsDomain, nil, nil, -1)
+		it, err := tx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).DomainRangeLatest(tx, kv.AccountsDomain, nil, nil, -1)
 		if err != nil {
 			panic(err)
 		}
@@ -1013,7 +1025,7 @@ func dumpPlainStateDebug(tx kv.RwTx, doms *state2.SharedDomains) {
 		}
 	}
 	{
-		it, err := tx.(state2.HasAggCtx).AggCtx().DomainRangeLatest(tx, kv.StorageDomain, nil, nil, -1)
+		it, err := tx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).DomainRangeLatest(tx, kv.StorageDomain, nil, nil, -1)
 		if err != nil {
 			panic(1)
 		}
@@ -1026,7 +1038,7 @@ func dumpPlainStateDebug(tx kv.RwTx, doms *state2.SharedDomains) {
 		}
 	}
 	{
-		it, err := tx.(state2.HasAggCtx).AggCtx().DomainRangeLatest(tx, kv.CommitmentDomain, nil, nil, -1)
+		it, err := tx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).DomainRangeLatest(tx, kv.CommitmentDomain, nil, nil, -1)
 		if err != nil {
 			panic(1)
 		}
@@ -1044,13 +1056,10 @@ func dumpPlainStateDebug(tx kv.RwTx, doms *state2.SharedDomains) {
 }
 
 // flushAndCheckCommitmentV3 - does write state to db and then check commitment
-func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyTx kv.RwTx, doms *state2.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, parallel bool, logger log.Logger, u Unwinder) (bool, error) {
+func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyTx kv.RwTx, doms *state2.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, parallel bool, logger log.Logger, u Unwinder, inMemExec bool) (bool, error) {
 	// E2 state root check was in another stage - means we did flush state even if state root will not match
 	// And Unwind expecting it
 	if !parallel {
-		if err := doms.Flush(ctx, applyTx); err != nil {
-			return false, err
-		}
 		if err := e.Update(applyTx, maxBlockNum); err != nil {
 			return false, err
 		}
@@ -1064,13 +1073,15 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	if doms.BlockNum() != header.Number.Uint64() {
 		panic(fmt.Errorf("%d != %d", doms.BlockNum(), header.Number.Uint64()))
 	}
-	rh, err := doms.ComputeCommitment(ctx, true, false, header.Number.Uint64(), u.LogPrefix())
+	rh, err := doms.ComputeCommitment(ctx, true, header.Number.Uint64(), u.LogPrefix())
 	if err != nil {
 		return false, fmt.Errorf("StateV3.Apply: %w", err)
 	}
 	if bytes.Equal(rh, header.Root.Bytes()) {
-		if err := doms.Flush(ctx, applyTx); err != nil {
-			return false, err
+		if !inMemExec {
+			if err := doms.Flush(ctx, applyTx); err != nil {
+				return false, err
+			}
 		}
 		return true, nil
 	}
@@ -1104,7 +1115,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		return false, nil
 	}
 
-	unwindToLimit, err := applyTx.(state2.HasAggCtx).AggCtx().CanUnwindDomainsToBlockNum(applyTx)
+	unwindToLimit, err := applyTx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).CanUnwindDomainsToBlockNum(applyTx)
 	if err != nil {
 		return false, err
 	}
@@ -1115,7 +1126,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	unwindTo := maxBlockNum - jump
 
 	// protect from too far unwind
-	allowedUnwindTo, ok, err := applyTx.(state2.HasAggCtx).AggCtx().CanUnwindBeforeBlockNum(unwindTo, applyTx)
+	allowedUnwindTo, ok, err := applyTx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).CanUnwindBeforeBlockNum(unwindTo, applyTx)
 	if err != nil {
 		return false, err
 	}

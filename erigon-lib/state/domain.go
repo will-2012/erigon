@@ -36,18 +36,17 @@ import (
 	btree2 "github.com/tidwall/btree"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/background"
 	"github.com/ledgerwatch/erigon-lib/common/dbg"
-	"github.com/ledgerwatch/erigon-lib/kv/iter"
-	"github.com/ledgerwatch/erigon-lib/kv/order"
-	"github.com/ledgerwatch/erigon-lib/metrics"
-
-	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/dir"
 	"github.com/ledgerwatch/erigon-lib/compress"
 	"github.com/ledgerwatch/erigon-lib/etl"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/bitmapdb"
+	"github.com/ledgerwatch/erigon-lib/kv/iter"
+	"github.com/ledgerwatch/erigon-lib/kv/order"
+	"github.com/ledgerwatch/erigon-lib/metrics"
 	"github.com/ledgerwatch/erigon-lib/recsplit"
 )
 
@@ -58,8 +57,6 @@ var (
 	LatestStateReadGrindNotFound = metrics.GetOrCreateSummary(`latest_state_read{type="grind",found="no"}`)  //nolint
 	LatestStateReadCold          = metrics.GetOrCreateSummary(`latest_state_read{type="cold",found="yes"}`)  //nolint
 	LatestStateReadColdNotFound  = metrics.GetOrCreateSummary(`latest_state_read{type="cold",found="no"}`)   //nolint
-	LatestStateReadDB            = metrics.GetOrCreateSummary(`latest_state_read{type="db",found="yes"}`)    //nolint
-	LatestStateReadDBNotFound    = metrics.GetOrCreateSummary(`latest_state_read{type="db",found="no"}`)     //nolint
 
 	mxRunningMerges        = metrics.GetOrCreateGauge("domain_running_merges")
 	mxRunningFilesBuilding = metrics.GetOrCreateGauge("domain_running_files_building")
@@ -82,7 +79,7 @@ var (
 
 // StepsInColdFile - files of this size are completely frozen/immutable.
 // files of smaller size are also immutable, but can be removed after merge to bigger files.
-const StepsInColdFile = 32
+const StepsInColdFile = 64
 
 var (
 	asserts          = dbg.EnvBool("AGG_ASSERTS", false)
@@ -94,13 +91,12 @@ var (
 
 // filesItem corresponding to a pair of files (.dat and .idx)
 type filesItem struct {
-	decompressor *compress.Decompressor
-	index        *recsplit.Index
-	bindex       *BtIndex
-	bm           *bitmapdb.FixedSizeBitmaps
-	existence    *ExistenceFilter
-	startTxNum   uint64
-	endTxNum     uint64
+	decompressor         *compress.Decompressor
+	index                *recsplit.Index
+	bindex               *BtIndex
+	bm                   *bitmapdb.FixedSizeBitmaps
+	existence            *ExistenceFilter
+	startTxNum, endTxNum uint64 //[startTxNum, endTxNum)
 
 	// Frozen: file of size StepsInColdFile. Completely immutable.
 	// Cold: file of size < StepsInColdFile. Immutable, but can be closed/removed after merge to bigger file.
@@ -562,7 +558,14 @@ func (d *Domain) scanStateFiles(fileNames []string) (garbageFiles []*filesItem) 
 			continue
 		}
 
+		// Semantic: [startTxNum, endTxNum)
+		// Example:
+		//   stepSize = 4
+		//   0-1.kv: [0, 8)
+		//   0-2.kv: [0, 16)
+		//   1-2.kv: [8, 16)
 		startTxNum, endTxNum := startStep*d.aggregationStep, endStep*d.aggregationStep
+
 		var newFile = newFilesItem(startTxNum, endTxNum, d.aggregationStep)
 		newFile.frozen = false
 
@@ -1614,7 +1617,7 @@ func (dc *DomainContext) Unwind(ctx context.Context, rwTx kv.RwTx, step, txNumUn
 
 	logEvery := time.NewTicker(time.Second * 30)
 	defer logEvery.Stop()
-	if err := dc.hc.Prune(ctx, rwTx, txNumUnindTo, math.MaxUint64, math.MaxUint64, true, logEvery); err != nil {
+	if err := dc.hc.Prune(ctx, rwTx, txNumUnindTo, math.MaxUint64, math.MaxUint64, true, true, logEvery); err != nil {
 		return fmt.Errorf("[domain][%s] unwinding, prune history to txNum=%d, step %d: %w", dc.d.filenameBase, txNumUnindTo, step, err)
 	}
 	return restored.flush(ctx, rwTx)
@@ -1893,21 +1896,19 @@ func (dc *DomainContext) GetLatest(key1, key2 []byte, roTx kv.Tx) ([]byte, bool,
 }
 
 func (dc *DomainContext) IteratePrefix(roTx kv.Tx, prefix []byte, it func(k []byte, v []byte) error) error {
+	// Implementation:
+	//     File endTxNum  = last txNum of file step
+	//     DB endTxNum    = first txNum of step in db
+	//     RAM endTxNum   = current txnum
+	//  Example: stepSize=8, file=0-2.kv, db has key of step 2, current tx num is 17
+	//     File endTxNum  = 15, because `0-2.kv` has steps 0 and 1, last txNum of step 1 is 15
+	//     DB endTxNum    = 16, because db has step 2, and first txNum of step 2 is 16.
+	//     RAM endTxNum   = 17, because current tcurrent txNum is 17
+
 	var cp CursorHeap
 	heap.Init(&cp)
 	var k, v []byte
 	var err error
-
-	//iter := sd.storage.Iter()
-	//if iter.Seek(string(prefix)) {
-	//	kx := iter.Key()
-	//	v = iter.Value()
-	//	k = []byte(kx)
-	//
-	//	if len(kx) > 0 && bytes.HasPrefix(k, prefix) {
-	//		heap.Push(&cp, &CursorItem{t: RAM_CURSOR, key: common.Copy(k), val: common.Copy(v), iter: iter, endTxNum: sd.txNum.Load(), reverse: true})
-	//	}
-	//}
 
 	keysCursor, err := roTx.CursorDupSort(dc.d.keysTable)
 	if err != nil {
@@ -1918,15 +1919,16 @@ func (dc *DomainContext) IteratePrefix(roTx kv.Tx, prefix []byte, it func(k []by
 		return err
 	}
 	if k != nil && bytes.HasPrefix(k, prefix) {
+		step := ^binary.BigEndian.Uint64(v)
+		endTxNum := step * dc.d.aggregationStep // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
+
 		keySuffix := make([]byte, len(k)+8)
 		copy(keySuffix, k)
 		copy(keySuffix[len(k):], v)
-		step := ^binary.BigEndian.Uint64(v)
-		txNum := step * dc.d.aggregationStep
 		if v, err = roTx.GetOne(dc.d.valsTable, keySuffix); err != nil {
 			return err
 		}
-		heap.Push(&cp, &CursorItem{t: DB_CURSOR, key: k, val: v, c: keysCursor, endTxNum: txNum + dc.d.aggregationStep, reverse: true})
+		heap.Push(&cp, &CursorItem{t: DB_CURSOR, key: k, val: v, c: keysCursor, endTxNum: endTxNum, reverse: true})
 	}
 
 	for i, item := range dc.files {
@@ -1942,7 +1944,8 @@ func (dc *DomainContext) IteratePrefix(roTx kv.Tx, prefix []byte, it func(k []by
 			key := cursor.Key()
 			if key != nil && bytes.HasPrefix(key, prefix) {
 				val := cursor.Value()
-				heap.Push(&cp, &CursorItem{t: FILE_CURSOR, dg: dc.statelessGetter(i), key: key, val: val, btCursor: cursor, endTxNum: item.endTxNum, reverse: true})
+				txNum := item.endTxNum - 1 // !important: .kv files have semantic [from, t)
+				heap.Push(&cp, &CursorItem{t: FILE_CURSOR, dg: dc.statelessGetter(i), key: key, val: val, btCursor: cursor, endTxNum: txNum, reverse: true})
 			}
 		} else {
 			ir := dc.statelessIdxReader(i)
@@ -1956,7 +1959,8 @@ func (dc *DomainContext) IteratePrefix(roTx kv.Tx, prefix []byte, it func(k []by
 			dc.d.stats.FilesQueries.Add(1)
 			if key != nil && bytes.HasPrefix(key, prefix) {
 				val, lofft := g.Next(nil)
-				heap.Push(&cp, &CursorItem{t: FILE_CURSOR, dg: g, latestOffset: lofft, key: key, val: val, endTxNum: item.endTxNum, reverse: true})
+				txNum := item.endTxNum - 1 // !important: .kv files have semantic [from, t)
+				heap.Push(&cp, &CursorItem{t: FILE_CURSOR, dg: g, latestOffset: lofft, key: key, val: val, endTxNum: txNum, reverse: true})
 			}
 		}
 	}
@@ -1967,9 +1971,6 @@ func (dc *DomainContext) IteratePrefix(roTx kv.Tx, prefix []byte, it func(k []by
 		// Advance all the items that have this key (including the top)
 		for cp.Len() > 0 && bytes.Equal(cp[0].key, lastKey) {
 			ci1 := heap.Pop(&cp).(*CursorItem)
-			//if string(ci1.key) == string(hexutility.MustDecodeString("301f9a245a0adeb61835403f6fd256dd96d103942d747c6d41e95a5d655bc20ab0fac941c854894cc0ed84cdaf557374b49ed723")) {
-			//	fmt.Printf("found %x\n", ci1.key)
-			//}
 			switch ci1.t {
 			//case RAM_CURSOR:
 			//	if ci1.iter.Next() {
@@ -2008,6 +2009,10 @@ func (dc *DomainContext) IteratePrefix(roTx kv.Tx, prefix []byte, it func(k []by
 				}
 				if k != nil && bytes.HasPrefix(k, prefix) {
 					ci1.key = k
+					step := ^binary.BigEndian.Uint64(v)
+					endTxNum := step * dc.d.aggregationStep // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
+					ci1.endTxNum = endTxNum
+
 					keySuffix := make([]byte, len(k)+8)
 					copy(keySuffix, k)
 					copy(keySuffix[len(k):], v)
@@ -2100,7 +2105,19 @@ func (dc *DomainContext) Prune(ctx context.Context, rwTx kv.RwTx, step, txFrom, 
 		seek          = make([]byte, 0, 256)
 	)
 
-	for k, v, err := keysCursor.Last(); k != nil; k, v, err = keysCursor.Prev() {
+	prunedStep, _, err := GetExecV3PruneProgress(rwTx, dc.d.keysTable)
+	if err != nil {
+		dc.d.logger.Error("get domain pruning progress", "name", dc.d.filenameBase, "error", err)
+	}
+
+	if prunedStep != 0 {
+		step = ^prunedStep
+	}
+
+	k, v, err := keysCursor.Last()
+	//fmt.Printf("prune domain %s from %x|%x step %d\n", dc.d.filenameBase, k, v, step)
+
+	for ; k != nil; k, v, err = keysCursor.Prev() {
 		if err != nil {
 			return fmt.Errorf("iterate over %s domain keys: %w", dc.d.filenameBase, err)
 		}
@@ -2119,7 +2136,6 @@ func (dc *DomainContext) Prune(ctx context.Context, rwTx kv.RwTx, step, txFrom, 
 		mxPruneSizeDomain.Inc()
 		prunedKeys++
 
-		//fmt.Printf("prune value: %x step %d dom %s\n", seek, ^binary.BigEndian.Uint64(v), dc.d.filenameBase)
 		err = rwTx.Delete(dc.d.valsTable, seek)
 		if err != nil {
 			return fmt.Errorf("prune domain value: %w", err)
@@ -2142,8 +2158,14 @@ func (dc *DomainContext) Prune(ctx context.Context, rwTx kv.RwTx, step, txFrom, 
 
 		select {
 		case <-ctx.Done():
+			if err := SaveExecV3PruneProgress(rwTx, dc.d.keysTable, ^step, nil); err != nil {
+				dc.d.logger.Error("save domain pruning progress", "name", dc.d.filenameBase, "error", err)
+			}
 			return ctx.Err()
 		case <-logEvery.C:
+			if err := SaveExecV3PruneProgress(rwTx, dc.d.keysTable, ^step, nil); err != nil {
+				dc.d.logger.Error("save domain pruning progress", "name", dc.d.filenameBase, "error", err)
+			}
 			dc.d.logger.Info("[snapshots] prune domain", "name", dc.d.filenameBase, "step", step,
 				"steps", fmt.Sprintf("%.2f-%.2f", float64(txFrom)/float64(dc.d.aggregationStep), float64(txTo)/float64(dc.d.aggregationStep)))
 		default:
@@ -2153,10 +2175,14 @@ func (dc *DomainContext) Prune(ctx context.Context, rwTx kv.RwTx, step, txFrom, 
 		prunedMinStep = 0
 	} // minMax pruned step doesn't mean that we pruned all kv pairs for those step - we just pruned some keys of those steps.
 
+	if err := SaveExecV3PruneProgress(rwTx, dc.d.keysTable, 0, nil); err != nil {
+		dc.d.logger.Error("reset domain pruning progress", "name", dc.d.filenameBase, "error", err)
+	}
+
 	dc.d.logger.Info("[snapshots] prune domain", "name", dc.d.filenameBase, "step range", fmt.Sprintf("[%d, %d] requested %d", prunedMinStep, prunedMaxStep, step), "pruned keys", prunedKeys)
 	mxPruneTookDomain.ObserveDuration(st)
 
-	if err := dc.hc.Prune(ctx, rwTx, txFrom, txTo, limit, false, logEvery); err != nil {
+	if err := dc.hc.Prune(ctx, rwTx, txFrom, txTo, limit, false, false, logEvery); err != nil {
 		return fmt.Errorf("prune history at step %d [%d, %d): %w", step, txFrom, txTo, err)
 	}
 	return nil
@@ -2182,6 +2208,15 @@ type DomainLatestIterFile struct {
 func (hi *DomainLatestIterFile) Close() {
 }
 func (hi *DomainLatestIterFile) init(dc *DomainContext) error {
+	// Implementation:
+	//     File endTxNum  = last txNum of file step
+	//     DB endTxNum    = first txNum of step in db
+	//     RAM endTxNum   = current txnum
+	//  Example: stepSize=8, file=0-2.kv, db has key of step 2, current tx num is 17
+	//     File endTxNum  = 15, because `0-2.kv` has steps 0 and 1, last txNum of step 1 is 15
+	//     DB endTxNum    = 16, because db has step 2, and first txNum of step 2 is 16.
+	//     RAM endTxNum   = 17, because current tcurrent txNum is 17
+
 	heap.Init(hi.h)
 	var k, v []byte
 	var err error
@@ -2194,15 +2229,16 @@ func (hi *DomainLatestIterFile) init(dc *DomainContext) error {
 		return err
 	}
 	if k != nil && (hi.to == nil || bytes.Compare(k, hi.to) < 0) {
+		step := ^binary.BigEndian.Uint64(v)
+		endTxNum := step * dc.d.aggregationStep // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
+
 		keySuffix := make([]byte, len(k)+8)
 		copy(keySuffix, k)
 		copy(keySuffix[len(k):], v)
-		step := ^binary.BigEndian.Uint64(v)
-		txNum := step * dc.d.aggregationStep
 		if v, err = hi.roTx.GetOne(dc.d.valsTable, keySuffix); err != nil {
 			return err
 		}
-		heap.Push(hi.h, &CursorItem{t: DB_CURSOR, key: common.Copy(k), val: common.Copy(v), c: keysCursor, endTxNum: txNum, reverse: true})
+		heap.Push(hi.h, &CursorItem{t: DB_CURSOR, key: common.Copy(k), val: common.Copy(v), c: keysCursor, endTxNum: endTxNum, reverse: true})
 	}
 
 	for i, item := range dc.files {
@@ -2217,7 +2253,8 @@ func (hi *DomainLatestIterFile) init(dc *DomainContext) error {
 		key := btCursor.Key()
 		if key != nil && (hi.to == nil || bytes.Compare(key, hi.to) < 0) {
 			val := btCursor.Value()
-			heap.Push(hi.h, &CursorItem{t: FILE_CURSOR, key: key, val: val, btCursor: btCursor, endTxNum: item.endTxNum, reverse: true})
+			txNum := item.endTxNum - 1 // !important: .kv files have semantic [from, t)
+			heap.Push(hi.h, &CursorItem{t: FILE_CURSOR, key: key, val: val, btCursor: btCursor, endTxNum: txNum, reverse: true})
 		}
 	}
 	return hi.advanceInFiles()
@@ -2247,6 +2284,10 @@ func (hi *DomainLatestIterFile) advanceInFiles() error {
 				}
 				if k != nil && (hi.to == nil || bytes.Compare(k, hi.to) < 0) {
 					ci1.key = common.Copy(k)
+					step := ^binary.BigEndian.Uint64(v)
+					endTxNum := step * hi.dc.d.aggregationStep // DB can store not-finished step, it means - then set first txn in step - it anyway will be ahead of files
+					ci1.endTxNum = endTxNum
+
 					keySuffix := make([]byte, len(k)+8)
 					copy(keySuffix, k)
 					copy(keySuffix[len(k):], v)
@@ -2328,20 +2369,20 @@ type SelectedStaticFiles struct {
 	commitment     []*filesItem
 	commitmentIdx  []*filesItem
 	commitmentHist []*filesItem
-	codeI          int
-	storageI       int
-	accountsI      int
-	commitmentI    int
+	//codeI          int
+	//storageI       int
+	//accountsI      int
+	//commitmentI    int
 }
 
-func (sf SelectedStaticFiles) FillV3(s *SelectedStaticFilesV3) SelectedStaticFiles {
-	sf.accounts, sf.accountsIdx, sf.accountsHist = s.accounts, s.accountsIdx, s.accountsHist
-	sf.storage, sf.storageIdx, sf.storageHist = s.storage, s.storageIdx, s.storageHist
-	sf.code, sf.codeIdx, sf.codeHist = s.code, s.codeIdx, s.codeHist
-	sf.commitment, sf.commitmentIdx, sf.commitmentHist = s.commitment, s.commitmentIdx, s.commitmentHist
-	sf.codeI, sf.accountsI, sf.storageI, sf.commitmentI = s.codeI, s.accountsI, s.storageI, s.commitmentI
-	return sf
-}
+//func (sf SelectedStaticFiles) FillV3(s *SelectedStaticFilesV3) SelectedStaticFiles {
+//	sf.accounts, sf.accountsIdx, sf.accountsHist = s.accounts, s.accountsIdx, s.accountsHist
+//	sf.storage, sf.storageIdx, sf.storageHist = s.storage, s.storageIdx, s.storageHist
+//	sf.code, sf.codeIdx, sf.codeHist = s.code, s.codeIdx, s.codeHist
+//	sf.commitment, sf.commitmentIdx, sf.commitmentHist = s.commitment, s.commitmentIdx, s.commitmentHist
+//	sf.codeI, sf.accountsI, sf.storageI, sf.commitmentI = s.codeI, s.accountsI, s.storageI, s.commitmentI
+//	return sf
+//}
 
 func (sf SelectedStaticFiles) Close() {
 	for _, group := range [][]*filesItem{

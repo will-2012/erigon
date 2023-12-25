@@ -27,11 +27,12 @@ import (
 )
 
 var (
-	doMemstat     = EnvBool("NO_MEMSTAT", true)
-	writeMap      = EnvBool("WRITE_MAP", false)
-	noSync        = EnvBool("NO_SYNC", false)
-	mdbxReadahead = EnvBool("MDBX_READAHEAD", false)
-	mdbxLockInRam = EnvBool("MDBX_LOCK_IN_RAM", false)
+	doMemstat        = EnvBool("NO_MEMSTAT", true)
+	writeMap         = EnvBool("WRITE_MAP", false)
+	noSync           = EnvBool("NO_SYNC", false)
+	mdbxReadahead    = EnvBool("MDBX_READAHEAD", false)
+	mdbxLockInRam    = EnvBool("MDBX_LOCK_IN_RAM", false)
+	StagesOnlyBlocks = EnvBool("STAGES_ONLY_BLOCKS", false)
 
 	stopBeforeStage = EnvString("STOP_BEFORE_STAGE", "")
 	stopAfterStage  = EnvString("STOP_AFTER_STAGE", "")
@@ -46,7 +47,6 @@ var (
 
 	// force skipping of any non-Erigon2 .torrent files
 	DownloaderOnlyBlocks = EnvBool("DOWNLOADER_ONLY_BLOCKS", false)
-	StagesOnlyBlocks     = EnvBool("STAGES_ONLY_BLOCKS", false)
 )
 
 func ReadMemStats(m *runtime.MemStats) {
@@ -78,8 +78,8 @@ func DirtySpace() uint64 {
 			if err != nil {
 				panic(err)
 			}
+			log.Info("[Experiment]", "MDBX_DIRTY_SPACE_MB", i)
 			dirtySace = uint64(i * 1024 * 1024)
-			log.Info("[Experiment]", "MDBX_DIRTY_SPACE_MB", dirtySace)
 		}
 	})
 	return dirtySace

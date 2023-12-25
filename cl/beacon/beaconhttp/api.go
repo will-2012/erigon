@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 
 	"github.com/ledgerwatch/erigon-lib/types/ssz"
 	"github.com/ledgerwatch/erigon/cl/phase1/forkchoice/fork_graph"
 	"github.com/ledgerwatch/log/v3"
+	"golang.org/x/exp/slices"
 )
 
 var _ error = EndpointError{}
@@ -69,15 +71,21 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 		ans, err := h.Handle(r)
 		if err != nil {
 			log.Error("beacon api request error", "err", err)
-			endpointError := WrapEndpointError(err)
+			var endpointError *EndpointError
+			if e, ok := err.(*EndpointError); ok {
+				endpointError = e
+			} else {
+				endpointError = WrapEndpointError(err)
+			}
 			endpointError.WriteTo(w)
 			return
 		}
 		// TODO: ssz handler
 		// TODO: potentially add a context option to buffer these
 		contentType := r.Header.Get("Accept")
-		switch contentType {
-		case "application/octet-stream":
+		contentTypes := strings.Split(contentType, ",")
+		switch {
+		case slices.Contains(contentTypes, "application/octet-stream"):
 			sszMarshaler, ok := any(ans).(ssz.Marshaler)
 			if !ok {
 				NewEndpointError(http.StatusBadRequest, "This endpoint does not support SSZ response").WriteTo(w)
@@ -90,7 +98,7 @@ func HandleEndpoint[T any](h EndpointHandler[T]) http.HandlerFunc {
 				return
 			}
 			w.Write(encoded)
-		case "application/json", "":
+		case contentType == "*/*", contentType == "", slices.Contains(contentTypes, "text/html"), slices.Contains(contentTypes, "application/json"):
 			w.Header().Add("content-type", "application/json")
 			err := json.NewEncoder(w).Encode(ans)
 			if err != nil {

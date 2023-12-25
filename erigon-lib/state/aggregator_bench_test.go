@@ -44,7 +44,7 @@ type txWithCtx struct {
 }
 
 func WrapTxWithCtx(tx kv.Tx, ctx *AggregatorV3Context) *txWithCtx { return &txWithCtx{Tx: tx, ac: ctx} }
-func (tx *txWithCtx) AggCtx() *AggregatorV3Context                { return tx.ac }
+func (tx *txWithCtx) AggCtx() interface{}                         { return tx.ac }
 
 func BenchmarkAggregator_Processing(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -79,13 +79,13 @@ func BenchmarkAggregator_Processing(b *testing.B) {
 		key := <-longKeys
 		val := <-vals
 		txNum := uint64(i)
-		domains.SetTxNum(ctx, txNum)
+		domains.SetTxNum(txNum)
 		err := domains.DomainPut(kv.StorageDomain, key[:length.Addr], key[length.Addr:], val, prev)
 		prev = val
 		require.NoError(b, err)
 
 		if i%100000 == 0 {
-			_, err := domains.ComputeCommitment(ctx, true, false, domains.BlockNum(), "")
+			_, err := domains.ComputeCommitment(ctx, true, domains.BlockNum(), "")
 			require.NoError(b, err)
 		}
 	}

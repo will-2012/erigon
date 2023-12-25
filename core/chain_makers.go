@@ -343,7 +343,7 @@ func GenerateChain(config *chain.Config, parent *types.Block, engine consensus.E
 	txNumIncrement := func() {
 		txNum++
 		if histV3 {
-			domains.SetTxNum(ctx, uint64(txNum))
+			domains.SetTxNum(uint64(txNum))
 		}
 	}
 	genblock := func(i int, parent *types.Block, ibs *state.IntraBlockState, stateReader state.StateReader,
@@ -391,7 +391,7 @@ func GenerateChain(config *chain.Config, parent *types.Block, engine consensus.E
 				//	return nil, nil, err
 				//}
 				//b.header.Root, err = CalcHashRootForTests(tx, b.header, histV3, true)
-				stateRoot, err := domains.ComputeCommitment(ctx, true, false, b.header.Number.Uint64(), "")
+				stateRoot, err := domains.ComputeCommitment(ctx, true, b.header.Number.Uint64(), "")
 				if err != nil {
 					return nil, nil, fmt.Errorf("call to CalcTrieRoot: %w", err)
 				}
@@ -477,7 +477,7 @@ func CalcHashRootForTests(tx kv.RwTx, header *types.Header, histV4, trace bool) 
 		h := libcommon.NewHasher()
 		defer libcommon.ReturnHasherToPool(h)
 
-		it, err := tx.(state2.HasAggCtx).AggCtx().DomainRangeLatest(tx, kv.AccountsDomain, nil, nil, -1)
+		it, err := tx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).DomainRangeLatest(tx, kv.AccountsDomain, nil, nil, -1)
 		if err != nil {
 			return libcommon.Hash{}, err
 		}
@@ -502,7 +502,7 @@ func CalcHashRootForTests(tx kv.RwTx, header *types.Header, histV4, trace bool) 
 			}
 		}
 
-		it, err = tx.(state2.HasAggCtx).AggCtx().DomainRangeLatest(tx, kv.StorageDomain, nil, nil, -1)
+		it, err = tx.(state2.HasAggCtx).AggCtx().(*state2.AggregatorV3Context).DomainRangeLatest(tx, kv.StorageDomain, nil, nil, -1)
 		if err != nil {
 			return libcommon.Hash{}, err
 		}

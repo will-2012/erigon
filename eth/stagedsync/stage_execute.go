@@ -310,8 +310,7 @@ func reconstituteBlock(agg *libstate.AggregatorV3, db kv.RoDB, tx kv.Tx) (n uint
 var ErrTooDeepUnwind = fmt.Errorf("too deep unwind")
 
 func unwindExec3(u *UnwindState, s *StageState, tx kv.RwTx, ctx context.Context, accumulator *shards.Accumulator, logger log.Logger) (err error) {
-	domains := libstate.NewSharedDomains(tx)
-	defer domains.Close()
+	fmt.Printf("unwindv3: %d -> %d\n", u.CurrentBlockNumber, u.UnwindPoint)
 	//txTo, err := rawdbv3.TxNums.Min(tx, u.UnwindPoint+1)
 	//if err != nil {
 	//      return err
@@ -321,13 +320,16 @@ func unwindExec3(u *UnwindState, s *StageState, tx kv.RwTx, ctx context.Context,
 	//	return fmt.Errorf("commitment can unwind only to block: %d, requested: %d. UnwindTo was called with wrong value", bn, u.UnwindPoint)
 	//}
 
-	//unwindToLimit, err := tx.(libstate.HasAggCtx).AggCtx().CanUnwindDomainsToBlockNum(tx)
-	//if err != nil {
-	//	return err
-	//}
-	//if u.UnwindPoint < unwindToLimit {
-	//	return fmt.Errorf("%w: %d < %d", ErrTooDeepUnwind, u.UnwindPoint, unwindToLimit)
-	//}
+	unwindToLimit, err := tx.(libstate.HasAggCtx).AggCtx().(*libstate.AggregatorV3Context).CanUnwindDomainsToBlockNum(tx)
+	if err != nil {
+		return err
+	}
+	if u.UnwindPoint < unwindToLimit {
+		return fmt.Errorf("%w: %d < %d", ErrTooDeepUnwind, u.UnwindPoint, unwindToLimit)
+	}
+
+	domains := libstate.NewSharedDomains(tx)
+	defer domains.Close()
 	rs := state.NewStateV3(domains, logger)
 
 	// unwind all txs of u.UnwindPoint block. 1 txn in begin/end of block - system txs
@@ -900,7 +902,11 @@ func PruneExecutionStage(s *PruneState, tx kv.RwTx, cfg ExecuteBlockCfg, ctx con
 	defer logEvery.Stop()
 
 	if cfg.historyV3 {
-		if err = tx.(*temporal.Tx).AggCtx().PruneWithTimeout(ctx, 1*time.Second, tx); err != nil { // prune part of retired data, before commit
+		pruneTimeout := 1 * time.Second
+		if initialCycle {
+			pruneTimeout = 10 * time.Minute
+		}
+		if err = tx.(*temporal.Tx).AggCtx().(*libstate.AggregatorV3Context).PruneWithTimeout(ctx, pruneTimeout, tx); err != nil { // prune part of retired data, before commit
 			return err
 		}
 	} else {

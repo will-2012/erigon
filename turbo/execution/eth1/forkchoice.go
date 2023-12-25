@@ -14,6 +14,7 @@ import (
 	"github.com/ledgerwatch/erigon/eth/consensuschain"
 	"github.com/ledgerwatch/erigon/eth/stagedsync"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
+	"github.com/ledgerwatch/log/v3"
 )
 
 type forkchoiceOutcome struct {
@@ -101,7 +102,9 @@ func writeForkChoiceHashes(tx kv.RwTx, blockHash, safeHash, finalizedHash libcom
 	rawdb.WriteForkchoiceHead(tx, blockHash)
 }
 
-func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHash, safeHash, finalizedHash libcommon.Hash, outcomeCh chan forkchoiceOutcome) {
+const BIG_JUMP = 2_000
+
+func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, originalBlockHash, safeHash, finalizedHash libcommon.Hash, outcomeCh chan forkchoiceOutcome) {
 	if !e.semaphore.TryAcquire(1) {
 		sendForkchoiceReceiptWithoutWaiting(outcomeCh, &execution.ForkChoiceReceipt{
 			LatestValidHash: gointerfaces.ConvertHashToH256(libcommon.Hash{}),
@@ -111,10 +114,6 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 	}
 	defer e.semaphore.Release(1)
 
-	type canonicalEntry struct {
-		hash   libcommon.Hash
-		number uint64
-	}
 	tx, err := e.db.BeginRwNosync(ctx)
 	if err != nil {
 		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
@@ -122,9 +121,28 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 	}
 	defer tx.Rollback()
 
+	type canonicalEntry struct {
+		hash   libcommon.Hash
+		number uint64
+	}
 	defer e.forkValidator.ClearWithUnwind(e.accumulator, e.stateChangeConsumer)
+
+	blockHash := originalBlockHash
+
+	finishProgressBefore, err := stages.GetStageProgress(tx, stages.Finish)
+	if err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	headersProgressBefore, err := stages.GetStageProgress(tx, stages.Headers)
+	if err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	isSynced := finishProgressBefore > 0 && finishProgressBefore > e.blockReader.FrozenBlocks() && finishProgressBefore == headersProgressBefore
+
 	// Step one, find reconnection point, and mark all of those headers as canonical.
-	fcuHeader, err := e.blockReader.HeaderByHash(ctx, tx, blockHash)
+	fcuHeader, err := e.blockReader.HeaderByHash(ctx, tx, originalBlockHash)
 	if err != nil {
 		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 		return
@@ -134,13 +152,18 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 		return
 	}
 
+	tooBigJump := finishProgressBefore > 0 && fcuHeader.Number.Uint64()-finishProgressBefore > BIG_JUMP
+
+	if tooBigJump {
+		isSynced = false
+	}
+
 	canonicalHash, err := e.blockReader.CanonicalHash(ctx, tx, fcuHeader.Number.Uint64())
 	if err != nil {
 		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 		return
 	}
 
-	var finishProgressBefore, headersProgressBefore uint64
 	if fcuHeader.Number.Uint64() > 0 {
 		if canonicalHash == blockHash {
 			// if block hash is part of the canonical chain treat it as no-op.
@@ -205,7 +228,7 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			}
 			currentParentHash = currentHeader.ParentHash
 			if currentHeader.Number.Uint64() == 0 {
-				panic("assert") //uint-underflow
+				panic("assert:uint64 underflow") //uint-underflow
 			}
 			currentParentNumber = currentHeader.Number.Uint64() - 1
 			isCanonicalHash, err = rawdb.IsCanonicalHash(tx, currentParentHash, currentParentNumber)
@@ -220,16 +243,6 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			return
 		}
 
-		if finishProgressBefore, err = stages.GetStageProgress(tx, stages.Finish); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-		if headersProgressBefore, err = stages.GetStageProgress(tx, stages.Headers); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-
-		isSynced := finishProgressBefore > 0 && finishProgressBefore > e.blockReader.FrozenBlocks() && finishProgressBefore == headersProgressBefore
 		if e.hook != nil {
 			if err = e.hook.BeforeRun(tx, isSynced); err != nil {
 				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
@@ -243,7 +256,13 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 			return
 		}
-
+		if e.historyV3 {
+			if err := rawdbv3.TxNums.Truncate(tx, currentParentNumber+1); err != nil {
+				//if err := rawdbv3.TxNums.Truncate(tx, fcuHeader.Number.Uint64()); err != nil {
+				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+				return
+			}
+		}
 		// Mark all new canonicals as canonicals
 		for _, canonicalSegment := range newCanonicals {
 			chainReader := consensuschain.NewReader(e.config, tx, e.blockReader, e.logger)
@@ -272,57 +291,27 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			}
 		}
 		if e.historyV3 {
-			if err := rawdbv3.TxNums.Truncate(tx, fcuHeader.Number.Uint64()); err != nil {
-				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-				return
+			if len(newCanonicals) > 0 {
+				if err := rawdbv3.TxNums.Truncate(tx, newCanonicals[0].number); err != nil {
+					sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+					return
+				}
+				if err := rawdb.AppendCanonicalTxNums(tx, newCanonicals[len(newCanonicals)-1].number); err != nil {
+					sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+					return
+				}
 			}
-			if err := rawdb.AppendCanonicalTxNums(tx, fcuHeader.Number.Uint64()); err != nil {
-				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-				return
-			}
-
-		}
-
-		// Set Progress for headers and bodies accordingly.
-		if err := stages.SaveStageProgress(tx, stages.Headers, fcuHeader.Number.Uint64()); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-		if err := stages.SaveStageProgress(tx, stages.BlockHashes, fcuHeader.Number.Uint64()); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-		if err := stages.SaveStageProgress(tx, stages.Bodies, fcuHeader.Number.Uint64()); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-		if err = rawdb.WriteHeadHeaderHash(tx, blockHash); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-		if blockHash == e.forkValidator.ExtendingForkHeadHash() {
-			e.logger.Info("[updateForkchoice] Fork choice update: flushing in-memory state (built by previous newPayload)")
-			if err := e.forkValidator.FlushExtendingFork(tx, e.accumulator); err != nil {
-				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-				return
-			}
-		}
-		if e.forcePartialCommit {
-			if err := tx.Commit(); err != nil {
-				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-				return
-			}
-			tx = nil
+			//} else {
+			//if err := rawdbv3.TxNums.Truncate(tx, currentParentNumber+1); err != nil {
+			//	sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+			//	return
+			//}
+			//}
 		}
 	}
 
-	// Run the forkchoice
-	if err := e.executionPipeline.Run(e.db, tx, false); err != nil {
-		err = fmt.Errorf("updateForkChoice: %w", err)
-		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-		return
-	}
-	if e.forcePartialCommit {
+TooBigJumpStep:
+	if tx == nil {
 		tx, err = e.db.BeginRwNosync(ctx)
 		if err != nil {
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
@@ -330,7 +319,61 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 		}
 		defer tx.Rollback()
 	}
+	finishProgressBefore, err = stages.GetStageProgress(tx, stages.Finish)
+	if err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	tooBigJump = finishProgressBefore > 0 && fcuHeader.Number.Uint64() > finishProgressBefore && fcuHeader.Number.Uint64()-finishProgressBefore > BIG_JUMP
+	if tooBigJump { //jump forward by 1K blocks
+		log.Info("[sync] jump by 1K blocks", "currentJumpTo", finishProgressBefore+BIG_JUMP, "bigJumpTo", fcuHeader.Number.Uint64())
+		blockHash, err = e.blockReader.CanonicalHash(ctx, tx, finishProgressBefore+BIG_JUMP)
+		if err != nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+			return
+		}
+		fcuHeader, err = e.blockReader.HeaderByHash(ctx, tx, blockHash)
+		if err != nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+			return
+		}
+		if fcuHeader == nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, fmt.Errorf("forkchoice: block %x not found or was marked invalid", blockHash))
+			return
+		}
+	}
 
+	// Set Progress for headers and bodies accordingly.
+	if err := stages.SaveStageProgress(tx, stages.Headers, fcuHeader.Number.Uint64()); err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	if err := stages.SaveStageProgress(tx, stages.BlockHashes, fcuHeader.Number.Uint64()); err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	if err := stages.SaveStageProgress(tx, stages.Bodies, fcuHeader.Number.Uint64()); err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	if err = rawdb.WriteHeadHeaderHash(tx, blockHash); err != nil {
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
+	if blockHash == e.forkValidator.ExtendingForkHeadHash() {
+		e.logger.Info("[updateForkchoice] Fork choice update: flushing in-memory state (built by previous newPayload)")
+		if err := e.forkValidator.FlushExtendingFork(tx, e.accumulator); err != nil {
+			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+			return
+		}
+	}
+	// Run the forkchoice
+	initialCycle := tooBigJump
+	if err := e.executionPipeline.Run(e.db, tx, initialCycle); err != nil {
+		err = fmt.Errorf("updateForkChoice: %w", err)
+		sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+		return
+	}
 	// if head hash was set then success otherwise no
 	headHash := rawdb.ReadHeadBlockHash(tx)
 	headNumber := rawdb.ReadHeaderNumber(tx, headHash)
@@ -344,27 +387,31 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			e.logger.Warn("bad forkchoice", "head", headHash, "hash", blockHash)
 		}
 	} else {
-		valid, err := e.verifyForkchoiceHashes(ctx, tx, blockHash, finalizedHash, safeHash)
-		if err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
-		}
-		if !valid {
-			sendForkchoiceReceiptWithoutWaiting(outcomeCh, &execution.ForkChoiceReceipt{
-				Status:          execution.ExecutionStatus_InvalidForkchoice,
-				LatestValidHash: gointerfaces.ConvertHashToH256(libcommon.Hash{}),
-			})
-			return
-		}
-		if err := rawdb.TruncateCanonicalChain(ctx, tx, *headNumber+1); err != nil {
-			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
-			return
+		if !tooBigJump {
+			valid, err := e.verifyForkchoiceHashes(ctx, tx, blockHash, finalizedHash, safeHash)
+			if err != nil {
+				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+				return
+			}
+			if !valid {
+				sendForkchoiceReceiptWithoutWaiting(outcomeCh, &execution.ForkChoiceReceipt{
+					Status:          execution.ExecutionStatus_InvalidForkchoice,
+					LatestValidHash: gointerfaces.ConvertHashToH256(libcommon.Hash{}),
+				})
+				return
+			}
+			if err := rawdb.TruncateCanonicalChain(ctx, tx, *headNumber+1); err != nil {
+				sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
+				return
+			}
 		}
 
 		if err := tx.Commit(); err != nil {
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 			return
 		}
+		tx = nil
+
 		if e.hook != nil {
 			if err := e.db.View(ctx, func(tx kv.Tx) error {
 				return e.hook.AfterRun(tx, finishProgressBefore)
@@ -377,11 +424,16 @@ func (e *EthereumExecutionModule) updateForkChoice(ctx context.Context, blockHas
 			e.logger.Info("head updated", "hash", headHash, "number", *headNumber)
 		}
 
-		if err := e.db.Update(ctx, func(tx kv.RwTx) error { return e.executionPipeline.RunPrune(e.db, tx, false) }); err != nil {
+		if err := e.db.Update(ctx, func(tx kv.RwTx) error {
+			return e.executionPipeline.RunPrune(e.db, tx, initialCycle)
+		}); err != nil {
 			err = fmt.Errorf("updateForkChoice: %w", err)
 			sendForkchoiceErrorWithoutWaiting(outcomeCh, err)
 			return
 		}
+	}
+	if tooBigJump {
+		goto TooBigJumpStep
 	}
 
 	sendForkchoiceReceiptWithoutWaiting(outcomeCh, &execution.ForkChoiceReceipt{
