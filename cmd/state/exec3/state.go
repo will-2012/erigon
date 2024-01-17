@@ -2,6 +2,7 @@ package exec3
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/ledgerwatch/log/v3"
@@ -138,6 +139,7 @@ func (rw *Worker) SetReader(reader state.ResettableStateReader) {
 	rw.stateReader.SetTx(rw.Tx())
 	rw.ibs.Reset()
 	rw.ibs = state.New(rw.stateReader)
+	fmt.Printf("[worker] SetReader %T\n", reader)
 
 	switch reader.(type) {
 	case *state.HistoryReaderV3:
@@ -178,12 +180,12 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask) {
 
 	rw.ibs.Reset()
 	ibs := rw.ibs
-	//ibs.SetTrace(true)
+	ibs.SetTrace(true)
 
 	rules := txTask.Rules
 	var err error
 	header := txTask.Header
-	//fmt.Printf("txNum=%d blockNum=%d history=%t\n", txTask.TxNum, txTask.BlockNum, txTask.HistoryExecution)
+	fmt.Printf("txNum=%d blockNum=%d historyExecution=%t\n", txTask.TxNum, txTask.BlockNum, txTask.HistoryExecution)
 
 	switch {
 	case txTask.TxIndex == -1:
@@ -200,7 +202,7 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask) {
 		}
 
 		// Block initialisation
-		//fmt.Printf("txNum=%d, blockNum=%d, initialisation of the block\n", txTask.TxNum, txTask.BlockNum)
+		fmt.Printf("txNum=%d, blockNum=%d, initialisation of the block\n", txTask.TxNum, txTask.BlockNum)
 		syscall := func(contract libcommon.Address, data []byte, ibs *state.IntraBlockState, header *types.Header, constCall bool) ([]byte, error) {
 			return core.SysCallContract(contract, data, rw.chainConfig, ibs, header, rw.engine, constCall /* constCall */)
 		}
@@ -211,7 +213,7 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask) {
 			break
 		}
 
-		//fmt.Printf("txNum=%d, blockNum=%d, finalisation of the block\n", txTask.TxNum, txTask.BlockNum)
+		fmt.Printf("txNum=%d, blockNum=%d, finalisation of the block\n", txTask.TxNum, txTask.BlockNum)
 		// End of block transaction in a block
 		syscall := func(contract libcommon.Address, data []byte) ([]byte, error) {
 			return core.SysCallContract(contract, data, rw.chainConfig, ibs, header, rw.engine, false /* constCall */)
@@ -221,7 +223,6 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask) {
 		if err != nil {
 			txTask.Error = err
 		} else {
-			//incorrect unwind to block 2
 			//if err := ibs.CommitBlock(rules, rw.stateWriter); err != nil {
 			//	txTask.Error = err
 			//}
